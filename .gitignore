@@ -5,6 +5,3 @@ dist/
 build/
 .venv/
 .env
-data/*.csv
-data/*.json
-!data/.gitkeep
