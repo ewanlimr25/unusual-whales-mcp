@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+data/*.csv
+data/*.json
+!data/.gitkeep
