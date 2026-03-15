@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "unusual-whales-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Suite of MCP servers for analyzing Unusual Whales data exports"
 requires-python = ">=3.12"
 dependencies = [
@@ -20,3 +20,10 @@ uw-darkpool = "servers.dark_pool:main"
 uw-hotchains = "servers.hot_chains:main"
 uw-oi = "servers.oi_changes:main"
 uw-insights = "servers.insights:main"
+uw-historical = "servers.historical:main"
+uw-watchlist = "servers.watchlist:main"
+uw-strategy = "servers.strategy:main"
+uw-risk = "servers.risk:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["servers", "shared"]
