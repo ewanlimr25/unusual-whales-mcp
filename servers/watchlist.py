@@ -31,6 +31,113 @@ def _save_watchlist(data: dict):
     WATCHLIST_FILE.write_text(json.dumps(data, indent=2))
 
 
+def compute_watchlist_alerts(
+    date: str | None,
+    group: str | None = None,
+    min_volume_ratio: float = 1.5,
+) -> list[dict]:
+    """Return unusual-activity alerts for watchlist tickers. Returns empty list when no alerts."""
+    wl = _load_watchlist()
+    tickers = wl["groups"].get(group, []) if group else wl["tickers"]
+
+    if not tickers:
+        return []
+
+    alerts: list[dict] = []
+
+    try:
+        screener = load_data("screener", date)
+    except Exception:
+        screener = None
+    try:
+        dp = load_data("darkpool", date)
+        dp["premium"] = dp["premium"].astype(float)
+    except Exception:
+        dp = None
+    try:
+        oi = load_data("oi", date)
+        oi["oi_diff_plain"] = oi["oi_diff_plain"].astype(float)
+    except Exception:
+        oi = None
+
+    for ticker in tickers:
+        ticker_alerts: list[dict] = []
+
+        if screener is not None:
+            row = screener[screener["ticker"] == ticker]
+            if not row.empty:
+                r = row.iloc[0]
+                total_vol = float(r.get("call_volume", 0) or 0) + float(r.get("put_volume", 0) or 0)
+                avg_vol = float(r.get("avg_30_day_call_volume", 0) or 0) + float(r.get("avg_30_day_put_volume", 0) or 0)
+                if avg_vol > 0:
+                    vol_ratio = total_vol / avg_vol
+                    if vol_ratio >= min_volume_ratio:
+                        ticker_alerts.append({
+                            "type": "VOLUME_SPIKE",
+                            "detail": f"{vol_ratio:.1f}x average options volume",
+                            "severity": "high" if vol_ratio >= 3 else "medium",
+                        })
+                iv_rank = float(r.get("iv_rank", 0) or 0)
+                if iv_rank >= 80:
+                    ticker_alerts.append({
+                        "type": "HIGH_IV_RANK",
+                        "detail": f"IV rank at {iv_rank:.1f} — options are expensive",
+                        "severity": "medium",
+                    })
+                elif iv_rank <= 10 and iv_rank > 0:
+                    ticker_alerts.append({
+                        "type": "LOW_IV_RANK",
+                        "detail": f"IV rank at {iv_rank:.1f} — options are cheap",
+                        "severity": "medium",
+                    })
+                pcr = float(r.get("put_call_ratio", 0) or 0)
+                if pcr >= 3:
+                    ticker_alerts.append({
+                        "type": "HIGH_PUT_CALL",
+                        "detail": f"P/C ratio {pcr:.2f} — heavy put activity",
+                        "severity": "high",
+                    })
+                elif pcr <= 0.3 and pcr > 0:
+                    ticker_alerts.append({
+                        "type": "LOW_PUT_CALL",
+                        "detail": f"P/C ratio {pcr:.2f} — heavy call activity",
+                        "severity": "medium",
+                    })
+
+        if dp is not None:
+            dp_t = dp[dp["ticker"] == ticker]
+            if not dp_t.empty:
+                max_trade = dp_t["premium"].max()
+                if max_trade >= 1_000_000:
+                    ticker_alerts.append({
+                        "type": "LARGE_DARK_POOL",
+                        "detail": f"${max_trade:,.0f} single dark pool trade, {len(dp_t)} total trades",
+                        "severity": "high",
+                    })
+
+        if oi is not None:
+            oi_t = oi[oi["underlying_symbol"] == ticker]
+            if not oi_t.empty:
+                net = float(oi_t["oi_diff_plain"].sum())
+                if abs(net) >= 10000:
+                    oi_direction = "increasing" if net > 0 else "decreasing"
+                    ticker_alerts.append({
+                        "type": "OI_SHIFT",
+                        "detail": f"Net OI {oi_direction} by {abs(net):,.0f} contracts",
+                        "severity": "high" if abs(net) >= 50000 else "medium",
+                    })
+
+        if ticker_alerts:
+            alerts.append({
+                "ticker": ticker,
+                "alert_count": len(ticker_alerts),
+                "alerts": ticker_alerts,
+            })
+
+    alerts.sort(key=lambda x: x["alert_count"], reverse=True)
+    return alerts
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
@@ -213,113 +320,15 @@ async def call_tool(name: str, arguments: dict) -> list:
         wl = _load_watchlist()
         group = arguments.get("group")
         tickers = wl["groups"].get(group, []) if group else wl["tickers"]
-        date = arguments.get("date")
-        min_vol_ratio = arguments.get("min_volume_ratio", 1.5)
-
         if not tickers:
             return text_result("Watchlist is empty. Use manage_watchlist to add tickers first.")
-
-        alerts = []
-
-        try:
-            screener = load_data("screener", date)
-        except Exception:
-            screener = None
-        try:
-            dp = load_data("darkpool", date)
-            dp["premium"] = dp["premium"].astype(float)
-        except Exception:
-            dp = None
-        try:
-            oi = load_data("oi", date)
-            oi["oi_diff_plain"] = oi["oi_diff_plain"].astype(float)
-        except Exception:
-            oi = None
-
-        for ticker in tickers:
-            ticker_alerts = []
-
-            if screener is not None:
-                row = screener[screener["ticker"] == ticker]
-                if not row.empty:
-                    r = row.iloc[0]
-                    # Volume spike
-                    total_vol = float(r.get("call_volume", 0) or 0) + float(r.get("put_volume", 0) or 0)
-                    avg_vol = float(r.get("avg_30_day_call_volume", 0) or 0) + float(r.get("avg_30_day_put_volume", 0) or 0)
-                    if avg_vol > 0:
-                        vol_ratio = total_vol / avg_vol
-                        if vol_ratio >= min_vol_ratio:
-                            ticker_alerts.append({
-                                "type": "VOLUME_SPIKE",
-                                "detail": f"{vol_ratio:.1f}x average options volume",
-                                "severity": "high" if vol_ratio >= 3 else "medium",
-                            })
-                    # IV rank extreme
-                    iv_rank = float(r.get("iv_rank", 0) or 0)
-                    if iv_rank >= 80:
-                        ticker_alerts.append({
-                            "type": "HIGH_IV_RANK",
-                            "detail": f"IV rank at {iv_rank:.1f} — options are expensive",
-                            "severity": "medium",
-                        })
-                    elif iv_rank <= 10 and iv_rank > 0:
-                        ticker_alerts.append({
-                            "type": "LOW_IV_RANK",
-                            "detail": f"IV rank at {iv_rank:.1f} — options are cheap",
-                            "severity": "medium",
-                        })
-                    # Extreme P/C ratio
-                    pcr = float(r.get("put_call_ratio", 0) or 0)
-                    if pcr >= 3:
-                        ticker_alerts.append({
-                            "type": "HIGH_PUT_CALL",
-                            "detail": f"P/C ratio {pcr:.2f} — heavy put activity",
-                            "severity": "high",
-                        })
-                    elif pcr <= 0.3 and pcr > 0:
-                        ticker_alerts.append({
-                            "type": "LOW_PUT_CALL",
-                            "detail": f"P/C ratio {pcr:.2f} — heavy call activity",
-                            "severity": "medium",
-                        })
-
-            # Large dark pool activity
-            if dp is not None:
-                dp_t = dp[dp["ticker"] == ticker]
-                if not dp_t.empty:
-                    max_trade = dp_t["premium"].max()
-                    if max_trade >= 1_000_000:
-                        ticker_alerts.append({
-                            "type": "LARGE_DARK_POOL",
-                            "detail": f"${max_trade:,.0f} single dark pool trade, {len(dp_t)} total trades",
-                            "severity": "high",
-                        })
-
-            # Significant OI change
-            if oi is not None:
-                oi_t = oi[oi["underlying_symbol"] == ticker]
-                if not oi_t.empty:
-                    net = float(oi_t["oi_diff_plain"].sum())
-                    if abs(net) >= 10000:
-                        direction = "increasing" if net > 0 else "decreasing"
-                        ticker_alerts.append({
-                            "type": "OI_SHIFT",
-                            "detail": f"Net OI {direction} by {abs(net):,.0f} contracts",
-                            "severity": "high" if abs(net) >= 50000 else "medium",
-                        })
-
-            if ticker_alerts:
-                alerts.append({
-                    "ticker": ticker,
-                    "alert_count": len(ticker_alerts),
-                    "alerts": ticker_alerts,
-                })
-
+        alerts = compute_watchlist_alerts(
+            date=arguments.get("date"),
+            group=group,
+            min_volume_ratio=arguments.get("min_volume_ratio", 1.5),
+        )
         if not alerts:
             return text_result("No unusual activity detected on watchlist tickers today.")
-
-        # Sort by number of alerts (most interesting first)
-        alerts.sort(key=lambda x: x["alert_count"], reverse=True)
         return text_result(alerts)
 
     return text_result(f"Unknown tool: {name}")

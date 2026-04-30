@@ -2,7 +2,11 @@
 
 import asyncio
 import sys
+from datetime import date as date_cls
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -163,6 +167,44 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="iv_term_structure",
+            description=(
+                "Aggregate average implied volatility by expiry to identify the term structure shape. "
+                "BACKWARDATION (front IV > back IV) signals an imminent event or panic buying. "
+                "CONTANGO is the normal upward slope. KINKED indicates a binary event at a specific expiry."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                    "symbol": {"type": "string", "description": "Filter by ticker symbol (optional but recommended)"},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="gamma_exposure_profile",
+            description=(
+                "Calculate net dealer Gamma Exposure (GEX) per strike for a symbol. "
+                "Positive GEX = dealers long gamma, price-stabilizing (pinning). "
+                "Negative GEX = dealers short gamma, trend-amplifying. "
+                "Returns the Zero Gamma Level where dealer hedging pressure flips."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Ticker symbol (required \u2014 GEX is per-underlying)"},
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                    "include_zero_gamma": {
+                        "type": "boolean",
+                        "description": "Compute zero gamma flip level (default: true)",
+                        "default": True,
+                    },
+                },
+                "required": ["symbol"],
+            },
+        ),
     ]
 
 
@@ -308,6 +350,149 @@ async def call_tool(name: str, arguments: dict) -> list:
                 "side", "premium", "size", "delta", "gamma", "vega", "theta",
                 "implied_volatility", "underlying_price"]
         return df_to_result(df[[c for c in cols if c in df.columns]])
+
+    elif name == "iv_term_structure":
+        symbol = (arguments.get("symbol") or "").upper().strip() or None
+        iv_cols = ["underlying_symbol", "expiry", "implied_volatility"]
+        df = _load_options(date, usecols=iv_cols)
+        if symbol:
+            df = df[df["underlying_symbol"] == symbol]
+        df = df.copy()
+        df["implied_volatility"] = pd.to_numeric(df["implied_volatility"], errors="coerce")
+        df = df[df["implied_volatility"] > 0]
+        if df.empty:
+            return text_result({"error": f"No options data{f' for {symbol}' if symbol else ''}"})
+        df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce")
+        df = df.dropna(subset=["expiry"])
+
+        agg = (
+            df.groupby("expiry")
+            .agg(avg_iv=("implied_volatility", "mean"), contract_count=("implied_volatility", "count"))
+            .reset_index()
+            .sort_values("expiry")
+        )
+
+        today = date_cls.today()
+        agg["dte_approx"] = (agg["expiry"].dt.date - today).apply(lambda d: d.days)
+
+        iv_values = agg["avg_iv"].to_numpy()
+        n = len(agg)
+        kink_expiry = None
+
+        if n < 2:
+            structure = "INSUFFICIENT_DATA"
+        else:
+            first_iv, last_iv = float(iv_values[0]), float(iv_values[-1])
+            if first_iv > last_iv * 1.05:
+                structure = "BACKWARDATION"
+            elif last_iv > first_iv * 1.05:
+                structure = "CONTANGO"
+            elif n >= 4:
+                x = np.arange(n, dtype=float)
+                coeffs = np.polyfit(x, iv_values, 1)
+                fitted = np.polyval(coeffs, x)
+                safe_fitted = np.where(np.abs(fitted) > 0.001, np.abs(fitted), 0.001)
+                residuals = np.abs(iv_values - fitted) / safe_fitted
+                max_idx = int(np.argmax(residuals))
+                if residuals[max_idx] > 0.15:
+                    structure = "KINKED"
+                    kink_expiry = str(agg.iloc[max_idx]["expiry"].date())
+                else:
+                    structure = "FLAT"
+            else:
+                structure = "FLAT"
+
+        term_structure = [
+            {
+                "expiry": str(row["expiry"].date()),
+                "avg_iv": round(float(row["avg_iv"]), 4),
+                "avg_iv_pct": f"{row['avg_iv'] * 100:.1f}%",
+                "dte_approx": int(row["dte_approx"]),
+                "contract_count": int(row["contract_count"]),
+            }
+            for _, row in agg.iterrows()
+        ]
+
+        return text_result({
+            "symbol": symbol or "all",
+            "structure": structure,
+            "kink_expiry": kink_expiry,
+            "expiry_count": n,
+            "term_structure": term_structure,
+        })
+
+    elif name == "gamma_exposure_profile":
+        symbol = arguments["symbol"].upper().strip()
+        include_zero_gamma = arguments.get("include_zero_gamma", True)
+        gex_cols = ["underlying_symbol", "strike", "option_type", "gamma", "open_interest", "underlying_price"]
+        df = _load_options(date, usecols=gex_cols)
+        df = df[df["underlying_symbol"] == symbol].copy()
+        if df.empty:
+            return text_result({"error": f"No options data for {symbol}"})
+
+        df["gamma"] = pd.to_numeric(df["gamma"], errors="coerce")
+        df["open_interest"] = pd.to_numeric(df["open_interest"], errors="coerce")
+        df["underlying_price"] = pd.to_numeric(df["underlying_price"], errors="coerce")
+        df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+        df = df.dropna(subset=["gamma", "open_interest", "underlying_price", "strike"])
+        df = df[(df["gamma"] > 0) & (df["open_interest"] > 0)]
+        if df.empty:
+            return text_result({"error": f"No valid gamma/OI data for {symbol}"})
+
+        underlying_price = float(df["underlying_price"].median())
+
+        # GEX per row: positive for calls, negative for puts (dealer perspective)
+        df["gex"] = df["gamma"] * df["open_interest"] * 100 * df["underlying_price"]
+        df.loc[df["option_type"] == "put", "gex"] = -df.loc[df["option_type"] == "put", "gex"]
+
+        strike_gex = (
+            df.groupby("strike")["gex"]
+            .sum()
+            .reset_index()
+            .sort_values("strike")
+            .reset_index(drop=True)
+        )
+        total_gex = float(strike_gex["gex"].sum())
+
+        zero_gamma_level = None
+        if include_zero_gamma:
+            strike_gex["cumulative_gex"] = strike_gex["gex"].cumsum()
+            for i in range(1, len(strike_gex)):
+                g1 = float(strike_gex.iloc[i - 1]["cumulative_gex"])
+                g2 = float(strike_gex.iloc[i]["cumulative_gex"])
+                if g1 * g2 < 0:
+                    s1 = float(strike_gex.iloc[i - 1]["strike"])
+                    s2 = float(strike_gex.iloc[i]["strike"])
+                    zero_gamma_level = round(s1 + (s2 - s1) * (-g1) / (g2 - g1), 2)
+                    break
+
+        if zero_gamma_level is None:
+            regime = "FULLY_POSITIVE" if total_gex > 0 else "FULLY_NEGATIVE"
+        else:
+            regime = "POSITIVE" if underlying_price > zero_gamma_level else "NEGATIVE"
+
+        regime_desc = {
+            "POSITIVE": "Dealers net long gamma — expect mean-reversion and reduced volatility",
+            "NEGATIVE": "Dealers net short gamma — expect trend acceleration and increased volatility",
+            "FULLY_POSITIVE": "All strikes have positive net GEX — strong gamma pinning effect",
+            "FULLY_NEGATIVE": "All strikes have negative net GEX — strong gamma amplification",
+        }[regime]
+
+        per_strike = [
+            {"strike": float(r["strike"]), "net_gex": round(float(r["gex"]), 2)}
+            for _, r in strike_gex.iterrows()
+        ]
+
+        return text_result({
+            "symbol": symbol,
+            "underlying_price": round(underlying_price, 2),
+            "total_gex": round(total_gex, 0),
+            "zero_gamma_level": zero_gamma_level,
+            "regime": regime,
+            "regime_description": regime_desc,
+            "per_strike": per_strike[:50],
+            "note": "GEX most meaningful for index products (SPY, QQQ) and large-cap single stocks with deep OI.",
+        })
 
     return text_result(f"Unknown tool: {name}")
 

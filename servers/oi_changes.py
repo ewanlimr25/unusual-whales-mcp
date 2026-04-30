@@ -4,6 +4,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mcp.server import Server
@@ -75,6 +77,33 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="position_rolling_detector",
+            description=(
+                "Detect same-day position rolls: tickers where near-term OI decreased "
+                "AND far-term OI increased on the same day, inferring an institution closed "
+                "a near-expiry position and re-opened further out. "
+                "Caveat: single-day only — cross-session rolls are not detected."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                    "symbol": {"type": "string", "description": "Filter by underlying ticker (optional)"},
+                    "threshold": {
+                        "type": "integer",
+                        "description": "Min absolute OI change in each bucket to signal a roll (default: 1000)",
+                        "default": 1000,
+                    },
+                    "near_dte_max": {
+                        "type": "integer",
+                        "description": "Max DTE to classify as near-term bucket (default: 21)",
+                        "default": 21,
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -140,6 +169,73 @@ async def call_tool(name: str, arguments: dict) -> list:
                 "prev_ask_volume", "prev_bid_volume", "net_ask_bid",
                 "inferred_direction", "prev_total_premium", "stock_price", "dte", "sector"]
         return df_to_result(df[[c for c in cols if c in df.columns]])
+
+    elif name == "position_rolling_detector":
+        df = load_data("oi", date)
+        if arguments.get("symbol"):
+            df = df[df["underlying_symbol"] == arguments["symbol"].upper()]
+        threshold = arguments.get("threshold", 1000)
+        near_dte_max = arguments.get("near_dte_max", 21)
+
+        df = df.copy()
+        df["oi_diff_plain"] = pd.to_numeric(df["oi_diff_plain"], errors="coerce")
+        df["dte"] = pd.to_numeric(df["dte"], errors="coerce")
+        df = df.dropna(subset=["oi_diff_plain", "dte"])
+
+        # Infer option_type from option_symbol (OCC symbology: C=call, P=put)
+        df["is_call"] = df["option_symbol"].str.contains("C", na=False)
+        df["option_type_inferred"] = df["is_call"].map({True: "call", False: "put"})
+        df["bucket"] = df["dte"].apply(lambda d: "near" if d <= near_dte_max else "far")
+
+        grp = (
+            df.groupby(["underlying_symbol", "option_type_inferred", "bucket"])["oi_diff_plain"]
+            .sum()
+            .reset_index()
+        )
+
+        pivot = grp.pivot_table(
+            index=["underlying_symbol", "option_type_inferred"],
+            columns="bucket",
+            values="oi_diff_plain",
+            fill_value=0,
+        ).reset_index()
+        pivot.columns.name = None
+
+        for col in ["near", "far"]:
+            if col not in pivot.columns:
+                pivot[col] = 0.0
+
+        rolls = pivot[(pivot["near"] < -threshold) & (pivot["far"] > threshold)].copy()
+        rolls["roll_size"] = rolls.apply(lambda r: min(abs(r["near"]), r["far"]), axis=1)
+        rolls["balance_ratio"] = rolls.apply(
+            lambda r: round(min(abs(r["near"]), r["far"]) / max(abs(r["near"]), r["far"]), 3),
+            axis=1,
+        )
+        rolls = rolls.sort_values("roll_size", ascending=False)
+
+        results = [
+            {
+                "symbol": row["underlying_symbol"],
+                "option_type": row["option_type_inferred"],
+                "near_oi_change": int(row["near"]),
+                "far_oi_change": int(row["far"]),
+                "roll_size": int(row["roll_size"]),
+                "balance_ratio": float(row["balance_ratio"]),
+            }
+            for _, row in rolls.iterrows()
+        ]
+
+        return text_result({
+            "caveat": (
+                "Single-day detection only — cross-session rolls are not captured. "
+                "Detected rolls reflect contracts where near-DTE OI decreased "
+                "and far-DTE OI increased on the same trading day."
+            ),
+            "threshold": threshold,
+            "near_dte_max": near_dte_max,
+            "rolls_detected": len(results),
+            "results": results,
+        })
 
     return text_result(f"Unknown tool: {name}")
 

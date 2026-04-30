@@ -120,6 +120,50 @@ async def list_tools() -> list[Tool]:
                 "required": ["symbol"],
             },
         ),
+        Tool(
+            name="conviction_matrix",
+            description=(
+                "Classify the institutional scenario for a ticker by combining dark pool "
+                "buy/sell pressure with options flow direction. Distinguishes between: "
+                "DIRECTIONAL_LONG (stock + calls), HEDGED_LONG (stock + puts), "
+                "COVERED_CALL (stock + selling calls), DIRECTIONAL_SHORT (stock selling + puts), "
+                "and MIXED. Reveals the 'why' behind dark pool accumulation."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Stock ticker symbol"},
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                    "bull_threshold": {
+                        "type": "number",
+                        "description": "Dark pool buy ratio above this = bullish (default: 0.6)",
+                        "default": 0.6,
+                    },
+                    "bear_threshold": {
+                        "type": "number",
+                        "description": "Dark pool buy ratio below this = bearish (default: 0.4)",
+                        "default": 0.4,
+                    },
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="daily_synthesis",
+            description=(
+                "Single endpoint for morning briefing. Returns market regime, top bullish and bearish "
+                "signal confluence tickers, and watchlist alerts — all in one structured JSON. "
+                "Designed for automated workflows; the LLM writes the prose summary, not this tool."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                    "watchlist_group": {"type": "string", "description": "Watchlist group to scan (optional, defaults to full watchlist)"},
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -429,6 +473,157 @@ async def call_tool(name: str, arguments: dict) -> list:
                 )
 
         return text_result(result)
+
+    elif name == "conviction_matrix":
+        symbol = arguments["symbol"].upper().strip()
+        bull_threshold = arguments.get("bull_threshold", 0.6)
+        bear_threshold = arguments.get("bear_threshold", 0.4)
+
+        dp_stats = None
+        dp_buy_ratio = None
+        try:
+            dp = load_data("darkpool", date)
+            dp_sym = dp[dp["ticker"] == symbol].copy()
+            if not dp_sym.empty:
+                dp_sym["price"] = dp_sym["price"].astype(float)
+                dp_sym["nbbo_bid"] = dp_sym["nbbo_bid"].astype(float)
+                dp_sym["nbbo_ask"] = dp_sym["nbbo_ask"].astype(float)
+                dp_sym["size"] = dp_sym["size"].astype(int)
+                dp_sym["nbbo_mid"] = (dp_sym["nbbo_bid"] + dp_sym["nbbo_ask"]) / 2
+                dp_sym["dp_side"] = "sell"
+                dp_sym.loc[dp_sym["price"] >= dp_sym["nbbo_mid"], "dp_side"] = "buy"
+                buy_vol = int(dp_sym[dp_sym["dp_side"] == "buy"]["size"].sum())
+                sell_vol = int(dp_sym[dp_sym["dp_side"] == "sell"]["size"].sum())
+                total_dp_vol = buy_vol + sell_vol
+                dp_buy_ratio = buy_vol / total_dp_vol if total_dp_vol > 0 else 0.5
+                dp_stats = {
+                    "trades": len(dp_sym),
+                    "buy_volume": buy_vol,
+                    "sell_volume": sell_vol,
+                    "buy_ratio": round(dp_buy_ratio, 3),
+                }
+        except Exception:
+            pass
+
+        call_ask_vol = call_bid_vol = put_ask_vol = put_bid_vol = 0.0
+        opts_stats = None
+        try:
+            opts_cols = ["underlying_symbol", "option_type", "side", "size"]
+            opts = load_data("options", date, usecols=opts_cols)
+            opts_sym = opts[opts["underlying_symbol"] == symbol].copy()
+            if not opts_sym.empty:
+                opts_sym["size"] = opts_sym["size"].astype(float)
+                calls = opts_sym[opts_sym["option_type"] == "call"]
+                puts = opts_sym[opts_sym["option_type"] == "put"]
+                call_ask_vol = float(calls[calls["side"] == "ask"]["size"].sum())
+                call_bid_vol = float(calls[calls["side"] == "bid"]["size"].sum())
+                put_ask_vol = float(puts[puts["side"] == "ask"]["size"].sum())
+                put_bid_vol = float(puts[puts["side"] == "bid"]["size"].sum())
+                opts_stats = {
+                    "call_ask_volume": int(call_ask_vol),
+                    "call_bid_volume": int(call_bid_vol),
+                    "put_ask_volume": int(put_ask_vol),
+                    "put_bid_volume": int(put_bid_vol),
+                }
+        except Exception:
+            pass
+
+        if dp_buy_ratio is None and opts_stats is None:
+            scenario = "NO_DATA"
+            explanation = "No dark pool or options data found for this symbol."
+            confidence = 0.0
+        elif dp_buy_ratio is None:
+            scenario = "PARTIAL_DATA"
+            explanation = "Options data available but no dark pool activity found."
+            confidence = 0.0
+        else:
+            dp_bullish = dp_buy_ratio > bull_threshold
+            dp_bearish = dp_buy_ratio < bear_threshold
+
+            if dp_bullish:
+                if call_ask_vol > call_bid_vol and call_ask_vol > put_ask_vol:
+                    scenario = "DIRECTIONAL_LONG"
+                    explanation = "Dark pool buying + aggressive call purchases — institutional directional bet."
+                elif put_ask_vol > put_bid_vol and put_ask_vol >= call_ask_vol:
+                    scenario = "HEDGED_LONG"
+                    explanation = "Dark pool buying + put protection — institution buying stock and hedging downside."
+                elif call_bid_vol > call_ask_vol:
+                    scenario = "COVERED_CALL"
+                    explanation = "Dark pool buying + call selling — yield enhancement strategy, capping upside."
+                else:
+                    scenario = "BULLISH_ACCUMULATION"
+                    explanation = "Dark pool buying with mixed options activity — directional bias unclear."
+            elif dp_bearish:
+                if put_ask_vol > put_bid_vol:
+                    scenario = "DIRECTIONAL_SHORT"
+                    explanation = "Dark pool selling + put buying — institutional directional bear bet."
+                else:
+                    scenario = "DISTRIBUTION"
+                    explanation = "Dark pool selling with mixed options activity."
+            else:
+                scenario = "MIXED"
+                explanation = "Balanced dark pool activity — no clear institutional directional bias."
+
+            dp_confidence = abs(dp_buy_ratio - 0.5) * 2
+            opts_confidence = 0.0
+            if scenario in ("DIRECTIONAL_LONG", "COVERED_CALL"):
+                total_call = call_ask_vol + call_bid_vol
+                if total_call > 0:
+                    opts_confidence = abs(call_ask_vol - call_bid_vol) / total_call
+            elif scenario in ("HEDGED_LONG", "DIRECTIONAL_SHORT"):
+                total_put = put_ask_vol + put_bid_vol
+                if total_put > 0:
+                    opts_confidence = abs(put_ask_vol - put_bid_vol) / total_put
+            confidence = round((dp_confidence + opts_confidence) / 2 * 100, 1)
+
+        return text_result({
+            "symbol": symbol,
+            "scenario": scenario,
+            "confidence_pct": confidence,
+            "explanation": explanation,
+            "dark_pool": dp_stats,
+            "options_flow": opts_stats,
+            "thresholds": {"bull": bull_threshold, "bear": bear_threshold},
+        })
+
+    elif name == "daily_synthesis":
+        from servers.risk import compute_market_regime, compute_signal_confluence
+        from servers.watchlist import compute_watchlist_alerts
+
+        watchlist_group = arguments.get("watchlist_group")
+
+        regime = None
+        bullish_signals = None
+        bearish_signals = None
+        watchlist_data = None
+
+        try:
+            regime = compute_market_regime(date)
+        except Exception as e:
+            regime = {"error": str(e)}
+
+        try:
+            bullish_signals = compute_signal_confluence(date, direction="bullish", top_n=10)
+        except Exception as e:
+            bullish_signals = {"error": str(e)}
+
+        try:
+            bearish_signals = compute_signal_confluence(date, direction="bearish", top_n=10)
+        except Exception as e:
+            bearish_signals = {"error": str(e)}
+
+        try:
+            watchlist_data = compute_watchlist_alerts(date, group=watchlist_group)
+        except Exception as e:
+            watchlist_data = {"error": str(e)}
+
+        return text_result({
+            "date": date or "latest",
+            "market_regime": regime,
+            "top_bullish_signals": bullish_signals,
+            "top_bearish_signals": bearish_signals,
+            "watchlist_alerts": watchlist_data,
+        })
 
     return text_result(f"Unknown tool: {name}")
 
