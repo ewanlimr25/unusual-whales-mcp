@@ -9,18 +9,28 @@ cd unusual-whales-mcp
 pip install -e .
 ```
 
-Data is read from `~/Documents/Stocks/` with this expected structure:
+Data is read from `~/Documents/Stocks/`. The MCP tools read **Parquet files** — run `convert.py` once after downloading CSVs to convert them (see [Daily Workflow](#daily-workflow)).
 
 ```
 ~/Documents/Stocks/
-├── All Options/          # bot-eod-report-YYYY-MM-DD.csv
-├── Dark pool/            # dp-eod-report-YYYY-MM-DD.csv
-├── Hot Option Chains/    # hot-chains-YYYY-MM-DD.csv
-├── Stock Screener/       # stock-screener-YYYY-MM-DD.csv
-└── OI changes/           # chain-oi-changes-YYYY-MM-DD.csv
+├── All Options/          # bot-eod-report-YYYY-MM-DD.parquet
+├── Dark pool/            # dp-eod-report-YYYY-MM-DD.parquet
+├── Hot Option Chains/    # hot-chains-YYYY-MM-DD.parquet
+├── Stock Screener/       # stock-screener-YYYY-MM-DD.parquet
+└── OI changes/           # chain-oi-changes-YYYY-MM-DD.parquet
 ```
 
-Download your daily data from Unusual Whales and drop the CSVs into the corresponding folders. The tools automatically use the most recent file, or you can specify a date.
+The tools automatically use the most recent file, or you can specify a date.
+
+### Converting CSVs to Parquet
+
+```bash
+python convert.py           # convert new CSVs → Parquet (deletes CSVs)
+python convert.py --revert  # roll back: Parquet → CSV (deletes Parquets)
+```
+
+- Already-converted files are skipped, so re-running daily is safe.
+- Parquet files are ~5–10x smaller than CSVs and load significantly faster via DuckDB.
 
 ## Adding to Claude Code
 
@@ -49,8 +59,14 @@ claude mcp add --transport stdio --scope user yahoo-finance -- uvx mcp-yahoo-fin
 
 ## Daily Workflow
 
-### Step 1: Download Data
-At end of day, download your CSVs from Unusual Whales and drop them into `~/Documents/Stocks/` subfolders.
+### Step 1: Download & Convert Data
+Download your CSVs from Unusual Whales and drop them into `~/Documents/Stocks/` subfolders, then convert:
+
+```bash
+python convert.py
+```
+
+Already-converted files are skipped — safe to run every day.
 
 ### Step 2: Market Pulse (2 min)
 Get the big picture before drilling in.
