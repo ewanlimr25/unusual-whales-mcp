@@ -34,6 +34,8 @@ async def list_tools() -> list[Tool]:
                     "top_n": {"type": "integer", "description": "Number of results (default: 20)", "default": 20},
                     "symbol": {"type": "string", "description": "Filter by underlying ticker (optional)"},
                     "min_oi_change": {"type": "integer", "description": "Min absolute OI change (optional)"},
+                    "min_dte": {"type": "integer", "description": "Filter to contracts with DTE >= min_dte (e.g. 180 for LEAPs only). Optional."},
+                    "max_dte": {"type": "integer", "description": "Filter to contracts with DTE <= max_dte (e.g. 30 for near-term only). Optional."},
                 },
                 "required": [],
             },
@@ -119,6 +121,14 @@ async def call_tool(name: str, arguments: dict) -> list:
         df["oi_diff_plain"] = df["oi_diff_plain"].astype(float)
         if arguments.get("min_oi_change"):
             df = df[df["oi_diff_plain"] >= arguments["min_oi_change"]]
+        if arguments.get("min_dte") is not None or arguments.get("max_dte") is not None:
+            df = df.copy()
+            df["dte"] = pd.to_numeric(df["dte"], errors="coerce")
+            df = df.dropna(subset=["dte"])
+            if arguments.get("min_dte") is not None:
+                df = df[df["dte"] >= arguments["min_dte"]]
+            if arguments.get("max_dte") is not None:
+                df = df[df["dte"] <= arguments["max_dte"]]
         df = df[df["oi_diff_plain"] > 0]
         df = df.sort_values("oi_diff_plain", ascending=False).head(top_n)
         cols = ["option_symbol", "underlying_symbol", "strike", "last_oi", "curr_oi",

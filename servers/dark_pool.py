@@ -59,14 +59,17 @@ async def list_tools() -> list[Tool]:
             name="dark_pool_price_levels",
             description=(
                 "For a given ticker, show which price levels saw the most dark pool "
-                "block activity. Reveals institutional support/resistance zones."
+                "block activity. Reveals institutional support/resistance zones. "
+                "Set days > 1 to aggregate across multiple recent sessions and find "
+                "recurring institutional defense levels."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest. Ignored when days > 1."},
                     "symbol": {"type": "string", "description": "Ticker symbol (required)"},
                     "top_n": {"type": "integer", "description": "Number of price levels (default: 15)", "default": 15},
+                    "days": {"type": "integer", "description": "Aggregate across this many recent sessions (default: 1 = single day)", "default": 1},
                 },
                 "required": ["symbol"],
             },
@@ -124,14 +127,31 @@ async def call_tool(name: str, arguments: dict) -> list:
         return df_to_result(agg)
 
     elif name == "dark_pool_price_levels":
-        df = load_data("darkpool", date)
         symbol = arguments["symbol"].upper()
+        days = max(1, int(arguments.get("days", 1)))
+        if days == 1:
+            df = load_data("darkpool", date)
+            dates_covered = [date] if date else [list_available_dates("darkpool")[0]] if list_available_dates("darkpool") else []
+        else:
+            dates_to_load = list_available_dates("darkpool")[:days]
+            if not dates_to_load:
+                return text_result(f"No dark pool data available for {symbol}")
+            frames = []
+            for d in dates_to_load:
+                try:
+                    frames.append(load_data("darkpool", d))
+                except Exception:
+                    continue
+            if not frames:
+                return text_result(f"No dark pool data could be loaded for {symbol}")
+            import pandas as pd
+            df = pd.concat(frames, ignore_index=True)
+            dates_covered = dates_to_load
         df = df[df["ticker"] == symbol]
         if df.empty:
-            return text_result(f"No dark pool trades found for {symbol}")
+            return text_result({"symbol": symbol, "dates_covered": dates_covered, "results": [], "note": f"No dark pool trades found for {symbol}"})
         df["price"] = df["price"].astype(float)
         df["premium"] = df["premium"].astype(float)
-        # Round price to nearest cent for grouping
         df["price_level"] = df["price"].round(2)
         agg = df.groupby("price_level").agg(
             total_premium=("premium", "sum"),
@@ -139,7 +159,11 @@ async def call_tool(name: str, arguments: dict) -> list:
             trade_count=("size", "count"),
         ).reset_index()
         agg = agg.sort_values("total_premium", ascending=False).head(top_n)
-        return df_to_result(agg)
+        return text_result({
+            "symbol": symbol,
+            "dates_covered": dates_covered,
+            "results": agg.to_dict(orient="records"),
+        })
 
     elif name == "extended_hours_filter":
         df = load_data("darkpool", date)

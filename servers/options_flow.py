@@ -184,6 +184,88 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="term_skew",
+            description=(
+                "Compute back-month put/call skew at a target DTE. Returns the IV at "
+                "~25-delta puts vs ~25-delta calls. Put IV >> call IV = market pricing tail risk. "
+                "Skew at multi-month low can flag complacency; skew at high flags hedging demand."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Ticker symbol (required)"},
+                    "dte_target": {"type": "integer", "description": "Target DTE for skew snapshot (default: 365)", "default": 365},
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="today_gamma_flip",
+            description=(
+                "Filter gamma_exposure_profile to today's expiry only. Returns the 0DTE "
+                "zero-gamma level, ATM gamma flip strike, and key support/resistance walls — "
+                "the precise dealer-hedging map for intraday/0DTE trading."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Ticker symbol (required)"},
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="front_end_iv_ratio",
+            description=(
+                "Compute the ratio of near-term IV to back-end IV. Ratio > 1.05 = BACKWARDATION "
+                "(panic / event imminent). Ratio < 0.95 = CONTANGO. Derived from the same data "
+                "as iv_term_structure but returns a single tradeable number."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Ticker symbol (required)"},
+                    "near_dte": {"type": "integer", "description": "Near-term DTE target (default: 1)", "default": 1},
+                    "far_dte": {"type": "integer", "description": "Back-end DTE target (default: 30)", "default": 30},
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="dte_volume_share",
+            description=(
+                "Share of total option volume by DTE bucket — 0DTE / weeklies / monthlies / LEAPs. "
+                "High 0DTE share = retail-driven session; high monthly+LEAP share = institutional. "
+                "Regime hint helps weight other signals."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Filter by ticker (optional; defaults to whole market)"},
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="sector_flow_persistence",
+            description=(
+                "Multi-day version of sector_flow_summary. Returns per-sector net flow across "
+                "the most recent N sessions and a persistence score (fraction of days flow held "
+                "the same sign). Used to detect durable sector rotations vs single-day noise."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "Number of recent sessions (default: 5)", "default": 5},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="gamma_exposure_profile",
             description=(
                 "Calculate net dealer Gamma Exposure (GEX) per strike for a symbol. "
@@ -419,6 +501,248 @@ async def call_tool(name: str, arguments: dict) -> list:
             "kink_expiry": kink_expiry,
             "expiry_count": n,
             "term_structure": term_structure,
+        })
+
+    elif name == "term_skew":
+        symbol = arguments["symbol"].upper().strip()
+        dte_target = int(arguments.get("dte_target", 365))
+        cols = ["underlying_symbol", "expiry", "option_type", "delta", "implied_volatility"]
+        df = _load_options(date, usecols=cols)
+        df = df[df["underlying_symbol"] == symbol].copy()
+        if df.empty:
+            return text_result({"symbol": symbol, "note": "no options data"})
+        df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce")
+        df["delta"] = pd.to_numeric(df["delta"], errors="coerce")
+        df["implied_volatility"] = pd.to_numeric(df["implied_volatility"], errors="coerce")
+        df = df.dropna(subset=["expiry", "delta", "implied_volatility"])
+        df = df[df["implied_volatility"] > 0]
+        if df.empty:
+            return text_result({"symbol": symbol, "note": "no valid skew data"})
+        today = date_cls.today()
+        df["dte"] = (df["expiry"].dt.date - today).apply(lambda d: d.days)
+        df = df[df["dte"] >= 0]
+        if df.empty:
+            return text_result({"symbol": symbol, "note": "no future expiries"})
+        df["dte_distance"] = (df["dte"] - dte_target).abs()
+        nearest_dte = int(df.sort_values("dte_distance").iloc[0]["dte"])
+        snap = df[df["dte"] == nearest_dte].copy()
+        snap["abs_delta"] = snap["delta"].abs()
+        snap["delta_distance"] = (snap["abs_delta"] - 0.25).abs()
+        calls = snap[snap["option_type"] == "call"].sort_values("delta_distance").head(5)
+        puts = snap[snap["option_type"] == "put"].sort_values("delta_distance").head(5)
+        if calls.empty or puts.empty:
+            return text_result({"symbol": symbol, "note": "insufficient call/put coverage at target DTE"})
+        call_iv = float(calls["implied_volatility"].mean())
+        put_iv = float(puts["implied_volatility"].mean())
+        skew = put_iv - call_iv
+        skew_ratio = put_iv / call_iv if call_iv > 0 else 0.0
+        if skew_ratio > 1.10:
+            interpretation = "TAIL_HEDGING"
+        elif skew_ratio < 1.02:
+            interpretation = "COMPLACENT"
+        else:
+            interpretation = "NORMAL"
+        return text_result({
+            "symbol": symbol,
+            "dte_target": dte_target,
+            "dte_actual": nearest_dte,
+            "call_25d_iv": round(call_iv, 4),
+            "put_25d_iv": round(put_iv, 4),
+            "skew": round(skew, 4),
+            "skew_ratio": round(skew_ratio, 3),
+            "interpretation": interpretation,
+        })
+
+    elif name == "today_gamma_flip":
+        symbol = arguments["symbol"].upper().strip()
+        cols = ["underlying_symbol", "strike", "option_type", "gamma", "open_interest", "underlying_price", "expiry"]
+        df = _load_options(date, usecols=cols)
+        df = df[df["underlying_symbol"] == symbol].copy()
+        if df.empty:
+            return text_result({"symbol": symbol, "note": "no options data"})
+        df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce")
+        df = df.dropna(subset=["expiry"])
+        if df.empty:
+            return text_result({"symbol": symbol, "note": "no valid expiry data"})
+        today_expiry = df["expiry"].dt.date.min()
+        df = df[df["expiry"].dt.date == today_expiry]
+        if df.empty:
+            return text_result({"symbol": symbol, "note": "no 0DTE data"})
+        df["gamma"] = pd.to_numeric(df["gamma"], errors="coerce")
+        df["open_interest"] = pd.to_numeric(df["open_interest"], errors="coerce")
+        df["underlying_price"] = pd.to_numeric(df["underlying_price"], errors="coerce")
+        df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+        df = df.dropna(subset=["gamma", "open_interest", "underlying_price", "strike"])
+        df = df[(df["gamma"] > 0) & (df["open_interest"] > 0)]
+        if df.empty:
+            return text_result({"symbol": symbol, "note": "no valid 0DTE gamma/OI"})
+        spot = float(df["underlying_price"].median())
+        df["gex"] = df["gamma"] * df["open_interest"] * 100 * df["underlying_price"]
+        df.loc[df["option_type"] == "put", "gex"] = -df.loc[df["option_type"] == "put", "gex"]
+        strike_gex = df.groupby("strike")["gex"].sum().reset_index().sort_values("strike").reset_index(drop=True)
+        total_gex = float(strike_gex["gex"].sum())
+
+        zero_gamma = None
+        strike_gex["cum"] = strike_gex["gex"].cumsum()
+        for i in range(1, len(strike_gex)):
+            g1 = float(strike_gex.iloc[i - 1]["cum"])
+            g2 = float(strike_gex.iloc[i]["cum"])
+            if g1 * g2 < 0:
+                s1 = float(strike_gex.iloc[i - 1]["strike"])
+                s2 = float(strike_gex.iloc[i]["strike"])
+                zero_gamma = round(s1 + (s2 - s1) * (-g1) / (g2 - g1), 2)
+                break
+
+        atm_flip = None
+        for i in range(1, len(strike_gex)):
+            if float(strike_gex.iloc[i - 1]["gex"]) * float(strike_gex.iloc[i]["gex"]) < 0:
+                atm_flip = float(strike_gex.iloc[i]["strike"])
+                if abs(atm_flip - spot) < abs((float(strike_gex.iloc[i - 1]["strike"])) - spot):
+                    break
+                else:
+                    atm_flip = float(strike_gex.iloc[i - 1]["strike"])
+                    break
+
+        regime = "POSITIVE" if total_gex > 0 else "NEGATIVE"
+
+        key_walls = []
+        for _, r in strike_gex.iterrows():
+            gex_val = float(r["gex"])
+            strike = float(r["strike"])
+            role = "support_wall" if gex_val > 0 and strike < spot else "resistance_wall" if gex_val < 0 and strike > spot else "support_wall" if gex_val > 0 else "resistance_wall"
+            key_walls.append({"strike": strike, "gex": round(gex_val, 0), "role": role})
+        key_walls = sorted(key_walls, key=lambda w: abs(w["gex"]), reverse=True)[:5]
+
+        return text_result({
+            "symbol": symbol,
+            "spot": round(spot, 2),
+            "today_expiry": str(today_expiry),
+            "today_zero_gamma": zero_gamma,
+            "atm_flip_strike": atm_flip,
+            "today_total_gex": round(total_gex, 0),
+            "regime": regime,
+            "key_walls": key_walls,
+        })
+
+    elif name == "front_end_iv_ratio":
+        symbol = arguments["symbol"].upper().strip()
+        near_dte = int(arguments.get("near_dte", 1))
+        far_dte = int(arguments.get("far_dte", 30))
+        cols = ["underlying_symbol", "expiry", "implied_volatility"]
+        df = _load_options(date, usecols=cols)
+        df = df[df["underlying_symbol"] == symbol].copy()
+        if df.empty:
+            return text_result({"symbol": symbol, "note": "no options data"})
+        df["implied_volatility"] = pd.to_numeric(df["implied_volatility"], errors="coerce")
+        df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce")
+        df = df.dropna(subset=["implied_volatility", "expiry"])
+        df = df[df["implied_volatility"] > 0]
+        today = date_cls.today()
+        df["dte"] = (df["expiry"].dt.date - today).apply(lambda d: d.days)
+        df = df[df["dte"] >= 0]
+        if df.empty:
+            return text_result({"symbol": symbol, "note": "no future expiries"})
+        df["near_distance"] = (df["dte"] - near_dte).abs()
+        df["far_distance"] = (df["dte"] - far_dte).abs()
+        nearest_near_dte = int(df.sort_values("near_distance").iloc[0]["dte"])
+        nearest_far_dte = int(df.sort_values("far_distance").iloc[0]["dte"])
+        near_iv = float(df[df["dte"] == nearest_near_dte]["implied_volatility"].mean())
+        far_iv = float(df[df["dte"] == nearest_far_dte]["implied_volatility"].mean())
+        ratio = near_iv / far_iv if far_iv > 0 else 0.0
+        if ratio > 1.05:
+            regime = "BACKWARDATION"
+        elif ratio < 0.95:
+            regime = "CONTANGO"
+        else:
+            regime = "FLAT"
+        return text_result({
+            "symbol": symbol,
+            "near_dte_actual": nearest_near_dte,
+            "far_dte_actual": nearest_far_dte,
+            "near_iv": round(near_iv, 4),
+            "far_iv": round(far_iv, 4),
+            "ratio": round(ratio, 3),
+            "regime": regime,
+        })
+
+    elif name == "dte_volume_share":
+        cols = ["underlying_symbol", "expiry", "size"]
+        df = _load_options(date, usecols=cols)
+        if arguments.get("symbol"):
+            df = df[df["underlying_symbol"] == arguments["symbol"].upper()]
+        if df.empty:
+            return text_result({"note": "no data"})
+        df = df.copy()
+        df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce")
+        df = df.dropna(subset=["expiry"])
+        today = date_cls.today()
+        df["dte"] = (df["expiry"].dt.date - today).apply(lambda d: d.days)
+        total = float(df["size"].sum())
+        if total == 0:
+            return text_result({"note": "zero volume"})
+        share_0dte = float(df[df["dte"] == 0]["size"].sum()) / total
+        share_weeklies = float(df[(df["dte"] >= 1) & (df["dte"] <= 7)]["size"].sum()) / total
+        share_monthlies = float(df[(df["dte"] >= 8) & (df["dte"] <= 45)]["size"].sum()) / total
+        share_leaps = float(df[df["dte"] > 180]["size"].sum()) / total
+        if share_0dte > 0.4:
+            hint = "RETAIL_DRIVEN"
+        elif (share_monthlies + share_leaps) > 0.6:
+            hint = "INSTITUTIONAL"
+        else:
+            hint = "BALANCED"
+        return text_result({
+            "symbol": arguments.get("symbol", "MARKET"),
+            "share_0dte": round(share_0dte, 3),
+            "share_weeklies": round(share_weeklies, 3),
+            "share_monthlies": round(share_monthlies, 3),
+            "share_leaps": round(share_leaps, 3),
+            "regime_hint": hint,
+        })
+
+    elif name == "sector_flow_persistence":
+        days = int(arguments.get("days", 5))
+        dates = list_available_dates("options")[:days]
+        if not dates:
+            return text_result({"note": "no options data available"})
+        per_day = {}
+        all_sectors = set()
+        for d in dates:
+            try:
+                df = _load_options(d, usecols=["sector", "option_type", "premium"])
+                df = df[df["sector"].notna() & (df["sector"] != "")]
+                pivot = df.pivot_table(index="sector", columns="option_type", values="premium", aggfunc="sum", fill_value=0)
+                for sector, row in pivot.iterrows():
+                    call_p = float(row.get("call", 0))
+                    put_p = float(row.get("put", 0))
+                    per_day.setdefault(sector, {})[d] = round(call_p - put_p, 2)
+                    all_sectors.add(sector)
+            except Exception:
+                continue
+        results = []
+        for sector in all_sectors:
+            day_flows = per_day.get(sector, {})
+            if not day_flows:
+                continue
+            signs = [1 if v > 0 else -1 if v < 0 else 0 for v in day_flows.values()]
+            if not signs:
+                continue
+            dominant = 1 if sum(s for s in signs if s > 0) > abs(sum(s for s in signs if s < 0)) else -1
+            persistence = sum(1 for s in signs if s == dominant) / len(signs)
+            if persistence >= 0.8:
+                trend = "INFLOW" if dominant > 0 else "OUTFLOW"
+            else:
+                trend = "ROTATING"
+            results.append({
+                "sector": sector,
+                "net_flow_by_day": day_flows,
+                "persistence_score": round(persistence, 3),
+                "trend": trend,
+            })
+        results.sort(key=lambda r: r["persistence_score"], reverse=True)
+        return text_result({
+            "days": days,
+            "dates_covered": dates,
+            "results": results,
         })
 
     elif name == "gamma_exposure_profile":

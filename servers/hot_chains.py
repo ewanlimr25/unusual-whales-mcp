@@ -10,7 +10,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool
 
-from shared.data_loader import load_data
+from shared.data_loader import load_data, list_available_dates
 from shared.server_utils import text_result, df_to_result
 
 server = Server("uw-hotchains")
@@ -79,6 +79,23 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="multi_day_sweep_persistence",
+            description=(
+                "Find tickers that appear in top sweep activity across multiple recent sessions. "
+                "Single-day sweeps are news; multi-day sweep campaigns are conviction. Returns "
+                "consistency_score = sessions_in_top / days, plus dominant_direction."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "Number of recent sessions to scan (default: 5)", "default": 5},
+                    "top_n": {"type": "integer", "description": "Top-N sweep tickers to track per session (default: 20)", "default": 20},
+                    "symbol": {"type": "string", "description": "Filter to a specific ticker (optional)"},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="multileg_activity",
             description=(
                 "Highlight contracts with significant multileg and stock-multileg volume \u2014 "
@@ -138,6 +155,72 @@ async def call_tool(name: str, arguments: dict) -> list:
         cols = ["option_symbol", "volume", "ask_side_volume", "bid_side_volume",
                 "net_flow", "ask_bid_ratio", "premium", "iv", "close", "sector"]
         return df_to_result(df[[c for c in cols if c in df.columns]])
+
+    elif name == "multi_day_sweep_persistence":
+        days = int(arguments.get("days", 5))
+        per_session_top = int(arguments.get("top_n", 20))
+        symbol_filter = arguments.get("symbol")
+        if symbol_filter:
+            symbol_filter = symbol_filter.upper()
+        dates = list_available_dates("hotchains")[:days]
+        if not dates:
+            return text_result({"note": "no hot chains data"})
+
+        per_ticker_sessions = {}
+        per_ticker_premium = {}
+        per_ticker_directions = {}
+        for d in dates:
+            try:
+                df = load_data("hotchains", d)
+                df = df[df["volume"] > 0].copy()
+                df["sweep_volume"] = df["sweep_volume"].fillna(0)
+                df = df[df["sweep_volume"] > 0]
+                df["ticker"] = df["option_symbol"].str.extract(r"^([A-Z]+)")[0]
+                if symbol_filter:
+                    df = df[df["ticker"] == symbol_filter]
+                df["ask_side_volume"] = df["ask_side_volume"].fillna(0)
+                df["bid_side_volume"] = df["bid_side_volume"].fillna(0)
+                ticker_agg = df.groupby("ticker").agg(
+                    total_sweep_premium=("premium", "sum"),
+                    total_ask=("ask_side_volume", "sum"),
+                    total_bid=("bid_side_volume", "sum"),
+                ).reset_index()
+                ticker_agg = ticker_agg.sort_values("total_sweep_premium", ascending=False).head(per_session_top)
+                for _, row in ticker_agg.iterrows():
+                    t = row["ticker"]
+                    if not t:
+                        continue
+                    per_ticker_sessions[t] = per_ticker_sessions.get(t, 0) + 1
+                    per_ticker_premium[t] = per_ticker_premium.get(t, 0.0) + float(row["total_sweep_premium"])
+                    direction = "bullish" if row["total_ask"] > row["total_bid"] else "bearish"
+                    per_ticker_directions.setdefault(t, []).append(direction)
+            except Exception:
+                continue
+
+        results = []
+        for t, sessions in per_ticker_sessions.items():
+            dirs = per_ticker_directions.get(t, [])
+            bull = sum(1 for d in dirs if d == "bullish")
+            bear = len(dirs) - bull
+            if bull > bear * 1.5:
+                dominant = "bullish"
+            elif bear > bull * 1.5:
+                dominant = "bearish"
+            else:
+                dominant = "mixed"
+            results.append({
+                "ticker": t,
+                "sessions_in_top": sessions,
+                "total_sweep_premium": round(per_ticker_premium[t], 2),
+                "dominant_direction": dominant,
+                "consistency_score": round(sessions / len(dates), 3),
+            })
+        results.sort(key=lambda r: (r["consistency_score"], r["total_sweep_premium"]), reverse=True)
+        return text_result({
+            "days": len(dates),
+            "dates_covered": dates,
+            "results": results,
+        })
 
     elif name == "multileg_activity":
         df = load_data("hotchains", date)

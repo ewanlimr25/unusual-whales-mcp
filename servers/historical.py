@@ -69,6 +69,39 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="cumulative_premium_flow",
+            description=(
+                "Sum bullish and bearish premium for a ticker across the most recent N sessions. "
+                "Long-window cumulative flow is the LEAP-grade signature — slow accretion of net "
+                "directional premium over weeks/months."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Stock ticker symbol"},
+                    "days": {"type": "integer", "description": "Number of recent sessions to sum (default: 90)", "default": 90},
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="pc_ratio_zscore",
+            description=(
+                "Z-score of a ticker's current put/call ratio vs its trailing window. "
+                "|z| > 2 = sentiment extreme (BULLISH_EXTREME if ratio is unusually low, "
+                "BEARISH_EXTREME if unusually high). Replaces raw P/C rank with a proper "
+                "statistical measure."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Stock ticker symbol"},
+                    "lookback_days": {"type": "integer", "description": "Window for mean/std (default: 20)", "default": 20},
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
             name="signal_backtest",
             description=(
                 "Backtest a signal: when a ticker showed similar unusual activity in past data, "
@@ -222,6 +255,87 @@ async def call_tool(name: str, arguments: dict) -> list:
                 break
 
         return text_result(result)
+
+    elif name == "cumulative_premium_flow":
+        symbol = arguments["symbol"].upper()
+        days = int(arguments.get("days", 90))
+        dates = list_available_dates("screener")[:days]
+        if not dates:
+            return text_result(f"No screener data available for {symbol}")
+        cum_bull = 0.0
+        cum_bear = 0.0
+        dates_covered = []
+        for d in dates:
+            try:
+                df = load_data("screener", d)
+                row = df[df["ticker"] == symbol]
+                if row.empty:
+                    continue
+                r = row.iloc[0]
+                cum_bull += float(r.get("bullish_premium", 0) or 0)
+                cum_bear += float(r.get("bearish_premium", 0) or 0)
+                dates_covered.append(d)
+            except Exception:
+                continue
+        if not dates_covered:
+            return text_result(f"No data found for {symbol} in last {days} sessions")
+        net = cum_bull - cum_bear
+        if abs(net) < 0.05 * (cum_bull + cum_bear + 1):
+            trend = "MIXED"
+        else:
+            trend = "BULLISH" if net > 0 else "BEARISH"
+        return text_result({
+            "symbol": symbol,
+            "days": days,
+            "dates_covered": dates_covered,
+            "cumulative_bullish": round(cum_bull, 2),
+            "cumulative_bearish": round(cum_bear, 2),
+            "net_flow": round(net, 2),
+            "trend_direction": trend,
+        })
+
+    elif name == "pc_ratio_zscore":
+        symbol = arguments["symbol"].upper()
+        lookback = int(arguments.get("lookback_days", 20))
+        dates = list_available_dates("screener")[:lookback + 1]
+        if len(dates) < 5:
+            return text_result(f"Need at least 5 sessions of data; have {len(dates)}")
+        ratios = []
+        for d in dates:
+            try:
+                df = load_data("screener", d)
+                row = df[df["ticker"] == symbol]
+                if row.empty:
+                    continue
+                pc = row.iloc[0].get("put_call_ratio")
+                if pc is None:
+                    continue
+                ratios.append(float(pc))
+            except Exception:
+                continue
+        if len(ratios) < 5:
+            return text_result(f"Need at least 5 P/C readings for {symbol}; have {len(ratios)}")
+        current = ratios[0]
+        history = ratios[1:]
+        import statistics
+        mean = statistics.mean(history)
+        std = statistics.stdev(history) if len(history) > 1 else 0.0
+        z = (current - mean) / std if std > 0 else 0.0
+        if z > 2:
+            extreme = "BEARISH_EXTREME"
+        elif z < -2:
+            extreme = "BULLISH_EXTREME"
+        else:
+            extreme = "NORMAL"
+        return text_result({
+            "symbol": symbol,
+            "current_pc_ratio": round(current, 4),
+            "mean_pc_ratio": round(mean, 4),
+            "std_pc_ratio": round(std, 4),
+            "zscore": round(z, 3),
+            "extreme": extreme,
+            "lookback_days": len(history),
+        })
 
     elif name == "signal_backtest":
         signal_type = arguments["signal_type"]
