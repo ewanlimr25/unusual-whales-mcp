@@ -1,0 +1,38 @@
+{
+  "disabledAgents": [
+    "accumulation-hunter",
+    "chief-of-staff",
+    "contrarian-scanner",
+    "cpp-build-resolver",
+    "cpp-reviewer",
+    "earnings-scout",
+    "flutter-reviewer",
+    "go-build-resolver",
+    "go-reviewer",
+    "java-build-resolver",
+    "java-reviewer",
+    "job-scout",
+    "kotlin-build-resolver",
+    "kotlin-reviewer",
+    "python-reviewer",
+    "pytorch-build-resolver",
+    "risk-monitor",
+    "rust-build-resolver",
+    "rust-reviewer",
+    "sweep-tracker",
+    "e2e-runner",
+    "harness-optimizer",
+    "loop-operator"
+  ],
+  "enabledAgents": [
+    "architect",
+    "build-error-resolver",
+    "code-reviewer",
+    "doc-updater",
+    "planner",
+    "refactor-cleaner",
+    "security-reviewer",
+    "tdd-guide",
+    "typescript-reviewer"
+  ]
+}

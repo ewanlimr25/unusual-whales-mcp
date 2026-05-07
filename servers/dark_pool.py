@@ -10,10 +10,34 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool
 
+import pandas as pd
+
 from shared.data_loader import load_data, list_available_dates
+from shared.dp_classification import classify_dp_side
 from shared.server_utils import text_result, df_to_result
 
 server = Server("uw-darkpool")
+
+# Tier ordering (ascending). Used for min_tier filtering.
+_TIER_ORDER = ("retail", "large", "block", "mega")
+
+# Lower bounds (inclusive) per tier. Retail is the catch-all below `large`.
+_TIER_BOUNDARIES = {
+    "mega": 10_000_000.0,
+    "block": 1_000_000.0,
+    "large": 100_000.0,
+}
+
+
+def _classify_tier(premium: float) -> str:
+    """Classify a premium into a tier. Bounds are inclusive (>=)."""
+    if premium >= _TIER_BOUNDARIES["mega"]:
+        return "mega"
+    if premium >= _TIER_BOUNDARIES["block"]:
+        return "block"
+    if premium >= _TIER_BOUNDARIES["large"]:
+        return "large"
+    return "retail"
 
 
 @server.list_tools()
@@ -90,6 +114,31 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="dp_block_size_stratified",
+            description=(
+                "Stratify dark pool premium into 4 tiers per ticker — mega (>=$10M), "
+                "block (>=$1M), large (>=$100k), retail (<$100k) — with buy/sell ratio per "
+                "tier. Conviction in mega/block tiers is the institutional smart-money "
+                "signal; retail-tier moves are noise. Per Easley-Lopez de Prado-O'Hara 2012 "
+                "(flow toxicity / informed-trading proxy)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                    "symbol": {"type": "string", "description": "Filter by ticker (optional)"},
+                    "top_n": {"type": "integer", "description": "Number of tickers (default: 30)", "default": 30},
+                    "min_tier": {
+                        "type": "string",
+                        "enum": ["retail", "large", "block", "mega"],
+                        "description": "Only include tickers with at least one trade at this tier or higher (default: large)",
+                        "default": "large",
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -144,7 +193,6 @@ async def call_tool(name: str, arguments: dict) -> list:
                     continue
             if not frames:
                 return text_result(f"No dark pool data could be loaded for {symbol}")
-            import pandas as pd
             df = pd.concat(frames, ignore_index=True)
             dates_covered = dates_to_load
         df = df[df["ticker"] == symbol]
@@ -163,6 +211,108 @@ async def call_tool(name: str, arguments: dict) -> list:
             "symbol": symbol,
             "dates_covered": dates_covered,
             "results": agg.to_dict(orient="records"),
+        })
+
+    elif name == "dp_block_size_stratified":
+        top_n = int(arguments.get("top_n", 30))
+        min_tier = arguments.get("min_tier", "large")
+        symbol = arguments.get("symbol")
+
+        if top_n < 1 or top_n > 500:
+            raise ValueError(f"top_n must be 1-500, got {top_n}")
+        if min_tier not in _TIER_ORDER:
+            raise ValueError(
+                f"min_tier must be one of {_TIER_ORDER}, got {min_tier!r}"
+            )
+
+        try:
+            df = load_data(
+                "darkpool",
+                date,
+                usecols=["ticker", "price", "size", "premium", "nbbo_bid", "nbbo_ask"],
+            )
+        except FileNotFoundError:
+            return text_result({"error": "No data available for this date"})
+
+        if symbol:
+            df = df[df["ticker"] == symbol.upper()]
+        if df.empty:
+            return text_result({
+                "caveat": "Single-day dark pool stratification by premium tier.",
+                "results": [],
+            })
+
+        df = df.copy()
+        df["premium"] = pd.to_numeric(df["premium"], errors="coerce").fillna(0.0)
+        df["size"] = pd.to_numeric(df["size"], errors="coerce").fillna(0)
+        df["tier"] = df["premium"].apply(_classify_tier)
+        df = classify_dp_side(df)
+
+        # Aggregate per (ticker, tier)
+        df["_buy_size"] = df["size"].where(df["side"] == "buy", 0.0)
+        df["_sell_size"] = df["size"].where(df["side"] == "sell", 0.0)
+        grouped = (
+            df.groupby(["ticker", "tier"], as_index=False)
+            .agg(
+                total_premium=("premium", "sum"),
+                buy_volume=("_buy_size", "sum"),
+                sell_volume=("_sell_size", "sum"),
+                trade_count=("size", "count"),
+            )
+        )
+
+        # Pivot into per-ticker dict-of-tiers
+        min_tier_idx = _TIER_ORDER.index(min_tier)
+        eligible_tiers = set(_TIER_ORDER[min_tier_idx:])
+
+        results: list[dict] = []
+        for ticker, group in grouped.groupby("ticker"):
+            tier_data: dict[str, dict] = {
+                t: {"total_premium": 0.0, "buy_volume": 0, "sell_volume": 0, "trade_count": 0, "buy_ratio": 0.5}
+                for t in _TIER_ORDER
+            }
+            highest_tier_with_activity: str | None = None
+            for _, row in group.iterrows():
+                tier = row["tier"]
+                buy_v = float(row["buy_volume"])
+                sell_v = float(row["sell_volume"])
+                total_v = buy_v + sell_v
+                tier_data[tier] = {
+                    "total_premium": round(float(row["total_premium"]), 2),
+                    "buy_volume": int(buy_v),
+                    "sell_volume": int(sell_v),
+                    "trade_count": int(row["trade_count"]),
+                    "buy_ratio": round(buy_v / total_v, 3) if total_v > 0 else 0.5,
+                }
+                if highest_tier_with_activity is None or _TIER_ORDER.index(tier) > _TIER_ORDER.index(highest_tier_with_activity):
+                    highest_tier_with_activity = tier
+
+            # Filter: include ticker only if it has activity at min_tier or higher
+            if not any(tier_data[t]["trade_count"] > 0 for t in eligible_tiers):
+                continue
+
+            total_premium_all = sum(tier_data[t]["total_premium"] for t in _TIER_ORDER)
+            results.append({
+                "ticker": ticker,
+                "total_premium_all_tiers": round(total_premium_all, 2),
+                "highest_tier": highest_tier_with_activity,
+                **tier_data,
+            })
+
+        # Rank by mega+block premium (institutional signal strength)
+        results.sort(
+            key=lambda r: r["mega"]["total_premium"] + r["block"]["total_premium"],
+            reverse=True,
+        )
+        results = results[:top_n]
+
+        return text_result({
+            "caveat": (
+                "Single-day stratification. Tier boundaries: mega (>=$10M), block (>=$1M), "
+                "large (>=$100k), retail (<$100k). Conviction in mega/block tiers is the "
+                "institutional smart-money signal; retail-tier moves are noise."
+            ),
+            "results": results,
         })
 
     elif name == "extended_hours_filter":

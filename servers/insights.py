@@ -15,9 +15,143 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool
 
 from shared.data_loader import load_data, list_available_dates
+from shared.dp_classification import classify_dp_side
 from shared.server_utils import text_result, df_to_result
 
 server = Server("uw-insights")
+
+
+def compute_signal_confluence(
+    date: str | None,
+    direction: str = "bullish",
+    top_n: int = 20,
+    min_score: int = 3,
+) -> dict:
+    """Score tickers by multi-factor bullish/bearish signal alignment.
+
+    Phase 2: moved here from servers/risk.py — this is a multi-source
+    cross-data join (screener × darkpool × oi), which fits 'insights'
+    rather than 'risk'.
+    """
+    try:
+        screener = load_data("screener", date)
+    except Exception:
+        return {"error": "No screener data available"}
+
+    try:
+        dp = load_data("darkpool", date)
+    except Exception:
+        dp = None
+
+    try:
+        oi = load_data("oi", date)
+        oi["oi_diff_plain"] = oi["oi_diff_plain"].astype(float)
+    except Exception:
+        oi = None
+
+    scored = []
+    for _, row in screener.iterrows():
+        ticker = row["ticker"]
+        score = 0
+        factors = []
+
+        bull = float(row.get("bullish_premium", 0) or 0)
+        bear = float(row.get("bearish_premium", 0) or 0)
+        net = bull - bear
+        iv_rank = float(row.get("iv_rank", 0) or 0)
+        pcr = float(row.get("put_call_ratio", 0) or 0)
+        total_vol = float(row.get("call_volume", 0) or 0) + float(row.get("put_volume", 0) or 0)
+        avg_vol = float(row.get("avg_30_day_call_volume", 0) or 0) + float(row.get("avg_30_day_put_volume", 0) or 0)
+        vol_ratio = total_vol / avg_vol if avg_vol > 0 else 1
+
+        if direction == "bullish":
+            if net > 0:
+                score += 1
+                factors.append("bullish_flow")
+            if pcr < 0.7:
+                score += 1
+                factors.append("low_pcr")
+            if vol_ratio >= 2:
+                score += 1
+                factors.append("volume_spike")
+
+            if dp is not None:
+                dp_t = dp[dp["ticker"] == ticker]
+                if not dp_t.empty:
+                    classified = classify_dp_side(dp_t)
+                    classified["size"] = pd.to_numeric(classified["size"], errors="coerce").fillna(0)
+                    buy = int(classified.loc[classified["side"] == "buy", "size"].sum())
+                    sell = int(classified.loc[classified["side"] == "sell", "size"].sum())
+                    if buy > sell * 1.3:
+                        score += 1
+                        factors.append("dp_accumulation")
+
+            if oi is not None:
+                oi_t = oi[oi["underlying_symbol"] == ticker]
+                if not oi_t.empty:
+                    net_oi = float(oi_t["oi_diff_plain"].sum())
+                    if net_oi > 1000:
+                        score += 1
+                        factors.append("oi_building")
+
+            if iv_rank <= 30:
+                score += 1
+                factors.append("low_iv_cheap_options")
+
+        else:
+            if net < 0:
+                score += 1
+                factors.append("bearish_flow")
+            if pcr > 1.5:
+                score += 1
+                factors.append("high_pcr")
+            if vol_ratio >= 2:
+                score += 1
+                factors.append("volume_spike")
+
+            if dp is not None:
+                dp_t = dp[dp["ticker"] == ticker]
+                if not dp_t.empty:
+                    classified = classify_dp_side(dp_t)
+                    classified["size"] = pd.to_numeric(classified["size"], errors="coerce").fillna(0)
+                    buy = int(classified.loc[classified["side"] == "buy", "size"].sum())
+                    sell = int(classified.loc[classified["side"] == "sell", "size"].sum())
+                    if sell > buy * 1.3:
+                        score += 1
+                        factors.append("dp_distribution")
+
+            if oi is not None:
+                oi_t = oi[oi["underlying_symbol"] == ticker]
+                if not oi_t.empty:
+                    net_oi = float(oi_t["oi_diff_plain"].sum())
+                    if net_oi > 1000:
+                        score += 1
+                        factors.append("oi_building_puts")
+
+            if iv_rank >= 70:
+                score += 1
+                factors.append("high_iv_sell_premium")
+
+        if score >= min_score:
+            scored.append({
+                "ticker": ticker,
+                "score": score,
+                "factors": factors,
+                "close": row.get("close"),
+                "iv_rank": iv_rank,
+                "put_call_ratio": pcr,
+                "net_flow": net,
+                "volume_ratio": round(vol_ratio, 2),
+                "sector": row.get("sector"),
+            })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "direction": direction,
+        "min_score": min_score,
+        "tickers_found": len(scored),
+        "results": scored[:top_n],
+    }
 
 
 def _get_yahoo_data(symbol: str) -> dict:
@@ -149,17 +283,23 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
-            name="daily_synthesis",
+            name="signal_confluence",
             description=(
-                "Single endpoint for morning briefing. Returns market regime, top bullish and bearish "
-                "signal confluence tickers, and watchlist alerts — all in one structured JSON. "
-                "Designed for automated workflows; the LLM writes the prose summary, not this tool."
+                "Score tickers by how many bullish/bearish signals align. "
+                "Multi-factor scoring: flow direction, dark pool, OI changes, "
+                "IV rank, volume spike. Higher scores = stronger setups."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
-                    "watchlist_group": {"type": "string", "description": "Watchlist group to scan (optional, defaults to full watchlist)"},
+                    "direction": {
+                        "type": "string",
+                        "enum": ["bullish", "bearish"],
+                        "description": "Score for bullish or bearish confluence (default: bullish)",
+                    },
+                    "top_n": {"type": "integer", "description": "Number of results (default: 20)", "default": 20},
+                    "min_score": {"type": "integer", "description": "Min confluence score to show (default: 3)", "default": 3},
                 },
                 "required": [],
             },
@@ -358,21 +498,13 @@ async def call_tool(name: str, arguments: dict) -> list:
         if dp_ticker.empty:
             return text_result(f"No dark pool trades found for {symbol}")
 
-        dp_ticker = dp_ticker.copy()
-        dp_ticker["price"] = dp_ticker["price"].astype(float)
-        dp_ticker["premium"] = dp_ticker["premium"].astype(float)
-        dp_ticker["size"] = dp_ticker["size"].astype(int)
-        dp_ticker["nbbo_bid"] = dp_ticker["nbbo_bid"].astype(float)
-        dp_ticker["nbbo_ask"] = dp_ticker["nbbo_ask"].astype(float)
-        dp_ticker["nbbo_mid"] = (dp_ticker["nbbo_bid"] + dp_ticker["nbbo_ask"]) / 2
+        # Use canonical buy/sell classification from shared module
+        dp_ticker = classify_dp_side(dp_ticker)
+        dp_ticker["size"] = pd.to_numeric(dp_ticker["size"], errors="coerce").fillna(0).astype(int)
+        dp_ticker["premium"] = pd.to_numeric(dp_ticker["premium"], errors="coerce").fillna(0.0)
 
-        # Classify trades: above mid = buying pressure, below mid = selling pressure
-        dp_ticker["side"] = "neutral"
-        dp_ticker.loc[dp_ticker["price"] >= dp_ticker["nbbo_mid"], "side"] = "buy"
-        dp_ticker.loc[dp_ticker["price"] < dp_ticker["nbbo_mid"], "side"] = "sell"
-
-        buy_volume = int(dp_ticker[dp_ticker["side"] == "buy"]["size"].sum())
-        sell_volume = int(dp_ticker[dp_ticker["side"] == "sell"]["size"].sum())
+        buy_volume = int(dp_ticker.loc[dp_ticker["side"] == "buy", "size"].sum())
+        sell_volume = int(dp_ticker.loc[dp_ticker["side"] == "sell", "size"].sum())
         total_volume = buy_volume + sell_volume
 
         # Yahoo price context
@@ -483,21 +615,17 @@ async def call_tool(name: str, arguments: dict) -> list:
         dp_buy_ratio = None
         try:
             dp = load_data("darkpool", date)
-            dp_sym = dp[dp["ticker"] == symbol].copy()
+            dp_sym = dp[dp["ticker"] == symbol]
             if not dp_sym.empty:
-                dp_sym["price"] = dp_sym["price"].astype(float)
-                dp_sym["nbbo_bid"] = dp_sym["nbbo_bid"].astype(float)
-                dp_sym["nbbo_ask"] = dp_sym["nbbo_ask"].astype(float)
-                dp_sym["size"] = dp_sym["size"].astype(int)
-                dp_sym["nbbo_mid"] = (dp_sym["nbbo_bid"] + dp_sym["nbbo_ask"]) / 2
-                dp_sym["dp_side"] = "sell"
-                dp_sym.loc[dp_sym["price"] >= dp_sym["nbbo_mid"], "dp_side"] = "buy"
-                buy_vol = int(dp_sym[dp_sym["dp_side"] == "buy"]["size"].sum())
-                sell_vol = int(dp_sym[dp_sym["dp_side"] == "sell"]["size"].sum())
-                total_dp_vol = buy_vol + sell_vol
-                dp_buy_ratio = buy_vol / total_dp_vol if total_dp_vol > 0 else 0.5
+                # Single classification — derive ratio from the same frame
+                classified = classify_dp_side(dp_sym)
+                classified["size"] = pd.to_numeric(classified["size"], errors="coerce").fillna(0).astype(int)
+                buy_vol = int(classified.loc[classified["side"] == "buy", "size"].sum())
+                sell_vol = int(classified.loc[classified["side"] == "sell", "size"].sum())
+                total_vol = buy_vol + sell_vol
+                dp_buy_ratio = buy_vol / total_vol if total_vol > 0 else 0.5
                 dp_stats = {
-                    "trades": len(dp_sym),
+                    "trades": len(classified),
                     "buy_volume": buy_vol,
                     "sell_volume": sell_vol,
                     "buy_ratio": round(dp_buy_ratio, 3),
@@ -586,44 +714,13 @@ async def call_tool(name: str, arguments: dict) -> list:
             "thresholds": {"bull": bull_threshold, "bear": bear_threshold},
         })
 
-    elif name == "daily_synthesis":
-        from servers.risk import compute_market_regime, compute_signal_confluence
-        from servers.watchlist import compute_watchlist_alerts
-
-        watchlist_group = arguments.get("watchlist_group")
-
-        regime = None
-        bullish_signals = None
-        bearish_signals = None
-        watchlist_data = None
-
-        try:
-            regime = compute_market_regime(date)
-        except Exception as e:
-            regime = {"error": str(e)}
-
-        try:
-            bullish_signals = compute_signal_confluence(date, direction="bullish", top_n=10)
-        except Exception as e:
-            bullish_signals = {"error": str(e)}
-
-        try:
-            bearish_signals = compute_signal_confluence(date, direction="bearish", top_n=10)
-        except Exception as e:
-            bearish_signals = {"error": str(e)}
-
-        try:
-            watchlist_data = compute_watchlist_alerts(date, group=watchlist_group)
-        except Exception as e:
-            watchlist_data = {"error": str(e)}
-
-        return text_result({
-            "date": date or "latest",
-            "market_regime": regime,
-            "top_bullish_signals": bullish_signals,
-            "top_bearish_signals": bearish_signals,
-            "watchlist_alerts": watchlist_data,
-        })
+    elif name == "signal_confluence":
+        return text_result(compute_signal_confluence(
+            date=arguments.get("date"),
+            direction=arguments.get("direction", "bullish"),
+            top_n=arguments.get("top_n", 20),
+            min_score=arguments.get("min_score", 3),
+        ))
 
     return text_result(f"Unknown tool: {name}")
 

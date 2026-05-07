@@ -4,27 +4,36 @@ build-backend = "hatchling.build"
 
 [project]
 name = "unusual-whales-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "Suite of MCP servers for analyzing Unusual Whales data exports"
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.0.0",
-    "pandas>=2.0.0",
+    "pandas>=2.2.0",
     "duckdb>=1.0.0",
     "yfinance>=0.2.0",
 ]
 
 [project.scripts]
 uw-screener = "servers.screener:main"
-uw-options = "servers.options_flow:main"
+uw-options-flow = "servers.options_flow:main"
+uw-options-structure = "servers.options_structure:main"
 uw-darkpool = "servers.dark_pool:main"
 uw-hotchains = "servers.hot_chains:main"
 uw-oi = "servers.oi_changes:main"
 uw-insights = "servers.insights:main"
 uw-historical = "servers.historical:main"
 uw-watchlist = "servers.watchlist:main"
-uw-strategy = "servers.strategy:main"
+uw-playbook = "servers.playbook:main"
 uw-risk = "servers.risk:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["servers", "shared"]
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: pure unit tests, no I/O",
+    "integration: requires real Parquet data in ~/Documents/Stocks/",
+    "regression: regression tests for known bugs",
+]
+addopts = "-m 'not integration'"

@@ -66,8 +66,11 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="put_call_ratio_extremes",
             description=(
-                "Find tickers with unusual put/call ratios \u2014 high P/C may indicate "
-                "hedging or bearish bets, low P/C indicates bullish activity."
+                "[DEPRECATED v0.4.0] Use `pc_ratio_zscore` from uw-historical instead \u2014 "
+                "it computes a proper statistical z-score over a trailing window which "
+                "is robust to single-day outliers. This tool returns raw P/C extremes "
+                "for one day only (high P/C may indicate hedging or bearish bets, low "
+                "P/C indicates bullish activity). Will be removed in v0.5.0."
             ),
             inputSchema={
                 "type": "object",

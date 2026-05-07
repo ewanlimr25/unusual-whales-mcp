@@ -1,30 +1,41 @@
-"""MCP Server: Options strategy suggestions based on signals."""
+"""MCP Server: cross-data playbook tools — strategy suggestions and morning briefings.
+
+Phase 2 rename: was uw-strategy. Now houses:
+  - suggest_strategy        Rule-based options strategy picker for a single ticker
+  - batch_strategy_scan     Batched suggest_strategy over a list
+  - daily_synthesis         Single-call morning briefing (regime + confluence + watchlist)
+
+`daily_synthesis` was moved here from uw-insights; it imports from risk,
+insights, and watchlist via lazy (function-local) imports to avoid circular
+dependencies between the four servers.
+"""
+
+from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import pandas as pd
 from yfinance import Ticker
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool
 
 from shared.data_loader import load_data
+from shared.dp_classification import classify_dp_side
 from shared.server_utils import text_result
 
-server = Server("uw-strategy")
+server = Server("uw-playbook")
 
 
 def _analyze_signals(symbol: str, date=None) -> dict:
     """Gather all available signals for a ticker."""
-    signals = {"symbol": symbol, "factors": []}
+    signals: dict = {"symbol": symbol, "factors": []}
 
-    # Screener data
     try:
         screener = load_data("screener", date)
         row = screener[screener["ticker"] == symbol]
@@ -67,19 +78,15 @@ def _analyze_signals(symbol: str, date=None) -> dict:
     except Exception:
         pass
 
-    # Dark pool
+    # Dark pool — canonical buy/sell classification
     try:
         dp = load_data("darkpool", date)
         dp_t = dp[dp["ticker"] == symbol]
         if not dp_t.empty:
-            dp_t = dp_t.copy()
-            dp_t["premium"] = dp_t["premium"].astype(float)
-            dp_t["price"] = dp_t["price"].astype(float)
-            dp_t["nbbo_bid"] = dp_t["nbbo_bid"].astype(float)
-            dp_t["nbbo_ask"] = dp_t["nbbo_ask"].astype(float)
-            dp_t["mid"] = (dp_t["nbbo_bid"] + dp_t["nbbo_ask"]) / 2
-            buy_vol = int(dp_t[dp_t["price"] >= dp_t["mid"]]["size"].astype(int).sum())
-            sell_vol = int(dp_t[dp_t["price"] < dp_t["mid"]]["size"].astype(int).sum())
+            classified = classify_dp_side(dp_t)
+            classified["size"] = pd.to_numeric(classified["size"], errors="coerce").fillna(0)
+            buy_vol = int(classified.loc[classified["side"] == "buy", "size"].sum())
+            sell_vol = int(classified.loc[classified["side"] == "sell", "size"].sum())
             signals["dp_buy_volume"] = buy_vol
             signals["dp_sell_volume"] = sell_vol
             if buy_vol > sell_vol * 1.5:
@@ -89,11 +96,11 @@ def _analyze_signals(symbol: str, date=None) -> dict:
     except Exception:
         pass
 
-    # OI changes
     try:
         oi = load_data("oi", date)
         oi_t = oi[oi["underlying_symbol"] == symbol]
         if not oi_t.empty:
+            oi_t = oi_t.copy()
             oi_t["oi_diff_plain"] = oi_t["oi_diff_plain"].astype(float)
             net_oi = float(oi_t["oi_diff_plain"].sum())
             signals["net_oi_change"] = net_oi
@@ -104,7 +111,6 @@ def _analyze_signals(symbol: str, date=None) -> dict:
     except Exception:
         pass
 
-    # Yahoo data
     try:
         t = Ticker(symbol)
         info = t.info
@@ -122,10 +128,8 @@ def _analyze_signals(symbol: str, date=None) -> dict:
 def _suggest_strategies(signals: dict) -> list[dict]:
     """Generate strategy suggestions based on signal factors."""
     factors = set(signals.get("factors", []))
-    iv_rank = signals.get("iv_rank", 50)
-    strategies = []
+    strategies: list[dict] = []
 
-    # === HIGH IV STRATEGIES (sell premium) ===
     if "HIGH_IV" in factors:
         if "BULLISH_FLOW" in factors or "DP_ACCUMULATION" in factors:
             strategies.append({
@@ -151,7 +155,6 @@ def _suggest_strategies(signals: dict) -> list[dict]:
                 "ideal_if": "You expect the stock to stay range-bound or IV to contract",
                 "setup": "Sell OTM put spread + OTM call spread. Target 30-45 DTE, 16-delta wings.",
             })
-
         if signals.get("next_earnings"):
             strategies.append({
                 "strategy": "Pre-Earnings Iron Condor / Short Strangle",
@@ -161,7 +164,6 @@ def _suggest_strategies(signals: dict) -> list[dict]:
                 "setup": f"Set strikes outside implied move ({signals.get('implied_move_perc', 'N/A')}). Close immediately after earnings.",
             })
 
-    # === LOW IV STRATEGIES (buy premium) ===
     if "LOW_IV" in factors:
         if "BULLISH_FLOW" in factors:
             strategies.append({
@@ -188,7 +190,6 @@ def _suggest_strategies(signals: dict) -> list[dict]:
                 "setup": "Buy ATM straddle or OTM strangle. 30-45 DTE. Need stock to move beyond implied range.",
             })
 
-    # === DIRECTIONAL WITH CONFIRMATION ===
     if "BULLISH_FLOW" in factors and "DP_ACCUMULATION" in factors:
         strategies.append({
             "strategy": "Aggressive Long Calls (Multi-Signal Bullish)",
@@ -206,7 +207,6 @@ def _suggest_strategies(signals: dict) -> list[dict]:
             "setup": "Buy ITM or ATM puts. 30-60 DTE.",
         })
 
-    # === SQUEEZE SETUP ===
     if "HIGH_SHORT_INTEREST" in factors and "BULLISH_FLOW" in factors:
         strategies.append({
             "strategy": "Short Squeeze Play (Long Calls + Shares)",
@@ -216,7 +216,6 @@ def _suggest_strategies(signals: dict) -> list[dict]:
             "setup": "Buy slightly OTM calls 30-45 DTE. Or buy shares for no time decay risk.",
         })
 
-    # === OI BUILDING ===
     if "OI_BUILDING" in factors and "VOLUME_SPIKE" in factors:
         strategies.append({
             "strategy": "Follow the Smart Money (Directional)",
@@ -228,7 +227,7 @@ def _suggest_strategies(signals: dict) -> list[dict]:
 
     if not strategies:
         strategies.append({
-            "strategy": "No Clear Edge \u2014 Stay Flat",
+            "strategy": "No Clear Edge — Stay Flat",
             "reasoning": "No strong signal confluence detected. The best trade is sometimes no trade.",
             "risk": "N/A",
             "ideal_if": "Signals are mixed or weak",
@@ -276,12 +275,30 @@ async def list_tools() -> list[Tool]:
                 "required": ["symbols"],
             },
         ),
+        Tool(
+            name="daily_synthesis",
+            description=(
+                "Single endpoint for morning briefing. Returns market regime, top bullish and bearish "
+                "signal confluence tickers, and watchlist alerts — all in one structured JSON. "
+                "Designed for automated workflows; the LLM writes the prose summary, not this tool."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
+                    "watchlist_group": {"type": "string", "description": "Watchlist group to scan (optional, defaults to full watchlist)"},
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list:
     if name == "suggest_strategy":
+        if not arguments.get("symbol"):
+            raise ValueError("symbol is required")
         symbol = arguments["symbol"].upper()
         date = arguments.get("date")
         signals = _analyze_signals(symbol, date)
@@ -295,14 +312,15 @@ async def call_tool(name: str, arguments: dict) -> list:
         return text_result(result)
 
     elif name == "batch_strategy_scan":
+        if not arguments.get("symbols"):
+            raise ValueError("symbols list is required")
         symbols = [s.upper() for s in arguments["symbols"]]
         date = arguments.get("date")
         results = []
         for symbol in symbols:
             signals = _analyze_signals(symbol, date)
             strategies = _suggest_strategies(signals)
-            # Only include tickers with actionable strategies
-            has_edge = any(s["strategy"] != "No Clear Edge \u2014 Stay Flat" for s in strategies)
+            has_edge = any(s["strategy"] != "No Clear Edge — Stay Flat" for s in strategies)
             results.append({
                 "symbol": symbol,
                 "factors": signals["factors"],
@@ -313,9 +331,45 @@ async def call_tool(name: str, arguments: dict) -> list:
                 "flow_direction": signals.get("flow_direction"),
                 "close": signals.get("close"),
             })
-        # Sort: tickers with edge first, then by number of factors
         results.sort(key=lambda x: (not x["has_edge"], -len(x["factors"])))
         return text_result(results)
+
+    elif name == "daily_synthesis":
+        # Lazy imports avoid circular deps between playbook ↔ insights/risk/watchlist.
+        from servers.insights import compute_signal_confluence
+        from servers.risk import compute_market_regime
+        from servers.watchlist import compute_watchlist_alerts
+
+        date = arguments.get("date")
+        watchlist_group = arguments.get("watchlist_group")
+
+        try:
+            regime = compute_market_regime(date)
+        except Exception as e:
+            regime = {"error": str(e)}
+
+        try:
+            bullish_signals = compute_signal_confluence(date, direction="bullish", top_n=10)
+        except Exception as e:
+            bullish_signals = {"error": str(e)}
+
+        try:
+            bearish_signals = compute_signal_confluence(date, direction="bearish", top_n=10)
+        except Exception as e:
+            bearish_signals = {"error": str(e)}
+
+        try:
+            watchlist_data = compute_watchlist_alerts(date, group=watchlist_group)
+        except Exception as e:
+            watchlist_data = {"error": str(e)}
+
+        return text_result({
+            "date": date or "latest",
+            "market_regime": regime,
+            "top_bullish_signals": bullish_signals,
+            "top_bearish_signals": bearish_signals,
+            "watchlist_alerts": watchlist_data,
+        })
 
     return text_result(f"Unknown tool: {name}")
 

@@ -15,6 +15,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool
 
 from shared.data_loader import load_data
+from shared.dp_classification import classify_dp_side
 from shared.server_utils import text_result
 
 server = Server("uw-risk")
@@ -133,138 +134,6 @@ def compute_market_regime(date: str | None) -> dict:
     return result
 
 
-def compute_signal_confluence(
-    date: str | None,
-    direction: str = "bullish",
-    top_n: int = 20,
-    min_score: int = 3,
-) -> dict:
-    """Score tickers by multi-factor bullish/bearish signal alignment."""
-    try:
-        screener = load_data("screener", date)
-    except Exception:
-        return {"error": "No screener data available"}
-
-    try:
-        dp = load_data("darkpool", date)
-        dp["premium"] = dp["premium"].astype(float)
-        dp["price"] = dp["price"].astype(float)
-        dp["nbbo_bid"] = dp["nbbo_bid"].astype(float)
-        dp["nbbo_ask"] = dp["nbbo_ask"].astype(float)
-    except Exception:
-        dp = None
-
-    try:
-        oi = load_data("oi", date)
-        oi["oi_diff_plain"] = oi["oi_diff_plain"].astype(float)
-    except Exception:
-        oi = None
-
-    scored = []
-    for _, row in screener.iterrows():
-        ticker = row["ticker"]
-        score = 0
-        factors = []
-
-        bull = float(row.get("bullish_premium", 0) or 0)
-        bear = float(row.get("bearish_premium", 0) or 0)
-        net = bull - bear
-        iv_rank = float(row.get("iv_rank", 0) or 0)
-        pcr = float(row.get("put_call_ratio", 0) or 0)
-        total_vol = float(row.get("call_volume", 0) or 0) + float(row.get("put_volume", 0) or 0)
-        avg_vol = float(row.get("avg_30_day_call_volume", 0) or 0) + float(row.get("avg_30_day_put_volume", 0) or 0)
-        vol_ratio = total_vol / avg_vol if avg_vol > 0 else 1
-
-        if direction == "bullish":
-            if net > 0:
-                score += 1
-                factors.append("bullish_flow")
-            if pcr < 0.7:
-                score += 1
-                factors.append("low_pcr")
-            if vol_ratio >= 2:
-                score += 1
-                factors.append("volume_spike")
-
-            if dp is not None:
-                dp_t = dp[dp["ticker"] == ticker]
-                if not dp_t.empty:
-                    dp_t = dp_t.copy()
-                    dp_t["mid"] = (dp_t["nbbo_bid"] + dp_t["nbbo_ask"]) / 2
-                    buy = dp_t[dp_t["price"] >= dp_t["mid"]]["size"].astype(int).sum()
-                    sell = dp_t[dp_t["price"] < dp_t["mid"]]["size"].astype(int).sum()
-                    if buy > sell * 1.3:
-                        score += 1
-                        factors.append("dp_accumulation")
-
-            if oi is not None:
-                oi_t = oi[oi["underlying_symbol"] == ticker]
-                if not oi_t.empty:
-                    net_oi = float(oi_t["oi_diff_plain"].sum())
-                    if net_oi > 1000:
-                        score += 1
-                        factors.append("oi_building")
-
-            if iv_rank <= 30:
-                score += 1
-                factors.append("low_iv_cheap_options")
-
-        else:
-            if net < 0:
-                score += 1
-                factors.append("bearish_flow")
-            if pcr > 1.5:
-                score += 1
-                factors.append("high_pcr")
-            if vol_ratio >= 2:
-                score += 1
-                factors.append("volume_spike")
-
-            if dp is not None:
-                dp_t = dp[dp["ticker"] == ticker]
-                if not dp_t.empty:
-                    dp_t = dp_t.copy()
-                    dp_t["mid"] = (dp_t["nbbo_bid"] + dp_t["nbbo_ask"]) / 2
-                    buy = dp_t[dp_t["price"] >= dp_t["mid"]]["size"].astype(int).sum()
-                    sell = dp_t[dp_t["price"] < dp_t["mid"]]["size"].astype(int).sum()
-                    if sell > buy * 1.3:
-                        score += 1
-                        factors.append("dp_distribution")
-
-            if oi is not None:
-                oi_t = oi[oi["underlying_symbol"] == ticker]
-                if not oi_t.empty:
-                    net_oi = float(oi_t["oi_diff_plain"].sum())
-                    if net_oi > 1000:
-                        score += 1
-                        factors.append("oi_building_puts")
-
-            if iv_rank >= 70:
-                score += 1
-                factors.append("high_iv_sell_premium")
-
-        if score >= min_score:
-            scored.append({
-                "ticker": ticker,
-                "score": score,
-                "factors": factors,
-                "close": row.get("close"),
-                "iv_rank": iv_rank,
-                "put_call_ratio": pcr,
-                "net_flow": net,
-                "volume_ratio": round(vol_ratio, 2),
-                "sector": row.get("sector"),
-            })
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return {
-        "direction": direction,
-        "min_score": min_score,
-        "tickers_found": len(scored),
-        "results": scored[:top_n],
-    }
-
-
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
@@ -299,28 +168,6 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="signal_confluence",
-            description=(
-                "Score tickers by how many bullish/bearish signals align. "
-                "Multi-factor scoring: flow direction, dark pool, OI changes, "
-                "IV rank, volume spike, analyst sentiment. Higher scores = stronger setups."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "date": {"type": "string", "description": "Date (YYYY-MM-DD). Defaults to latest."},
-                    "direction": {
-                        "type": "string",
-                        "enum": ["bullish", "bearish"],
-                        "description": "Score for bullish or bearish confluence (default: bullish)",
-                    },
-                    "top_n": {"type": "integer", "description": "Number of results (default: 20)", "default": 20},
-                    "min_score": {"type": "integer", "description": "Min confluence score to show (default: 3)", "default": 3},
                 },
                 "required": [],
             },
@@ -404,15 +251,6 @@ async def call_tool(name: str, arguments: dict) -> list:
 
     elif name == "market_regime":
         return text_result(compute_market_regime(arguments.get("date")))
-
-    elif name == "signal_confluence":
-        result = compute_signal_confluence(
-            date=arguments.get("date"),
-            direction=arguments.get("direction", "bullish"),
-            top_n=arguments.get("top_n", 20),
-            min_score=arguments.get("min_score", 3),
-        )
-        return text_result(result)
 
     return text_result(f"Unknown tool: {name}")
 

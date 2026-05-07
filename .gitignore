@@ -5,3 +5,18 @@ dist/
 build/
 .venv/
 .env
+
+# Test artifacts
+.coverage
+.pytest_cache/
+
+# Local Claude Code settings (rules/ are tracked; local overrides are not)
+.claude/settings.local.json
+
+# User-specific data
+watchlist.json
+
+# Working docs (audit / planning / feedback notes — not part of public API)
+AUDIT_*.md
+PLAN.md
+FEEDBACK_ANALYSIS.md
