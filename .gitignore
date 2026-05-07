@@ -16,7 +16,5 @@ build/
 # User-specific data
 watchlist.json
 
-# Working docs (audit / planning / feedback notes — not part of public API)
-AUDIT_*.md
-PLAN.md
-FEEDBACK_ANALYSIS.md
+# Working docs — audits, plans, feedback notes (not part of public API)
+archive/
