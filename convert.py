@@ -21,8 +21,19 @@ FOLDER_MAP = {
 }
 
 
+def _csv_to_parquet(csv_path: Path, parquet_path: Path) -> None:
+    # Quote/escape are set explicitly: the sniffer only samples the first rows,
+    # and quoted fields (e.g. multi-value report_flags "{a,b}") can first appear
+    # millions of rows in, after the sniffer has already decided "no quoting".
+    duckdb.execute(
+        f"COPY (SELECT * FROM read_csv_auto('{csv_path}', header=true, "
+        f"quote='\"', escape='\"')) "
+        f"TO '{parquet_path}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+    )
+
+
 def convert_to_parquet() -> None:
-    converted = skipped = 0
+    converted = skipped = failed = 0
     for folder in FOLDER_MAP.values():
         data_dir = STOCKS_DIR / folder
         if not data_dir.exists():
@@ -35,14 +46,18 @@ def convert_to_parquet() -> None:
                 skipped += 1
                 continue
             print(f"  [convert] {csv_path.name} ...", end=" ", flush=True)
-            duckdb.execute(
-                f"COPY (SELECT * FROM read_csv_auto('{csv_path}', header=true)) "
-                f"TO '{parquet_path}' (FORMAT PARQUET, COMPRESSION ZSTD)"
-            )
+            try:
+                _csv_to_parquet(csv_path, parquet_path)
+            except duckdb.Error as e:
+                # Remove the partial file so the next run retries instead of skipping
+                parquet_path.unlink(missing_ok=True)
+                print(f"FAILED\n    {str(e).splitlines()[0]}")
+                failed += 1
+                continue
             csv_path.unlink()
             print("done")
             converted += 1
-    print(f"\n{converted} converted, {skipped} skipped.")
+    print(f"\n{converted} converted, {skipped} skipped, {failed} failed.")
 
 
 def revert_to_csv() -> None:
